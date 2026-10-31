@@ -263,7 +263,7 @@ class TestStereoCamera(BaseTester):
         _, zero_valid = camera.reproject_disparity_to_3D(torch.zeros_like(disparity), return_mask=True)
         assert not zero_valid.any()
 
-    @pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("default_dtype", [torch.float16, torch.float32, torch.float64])
     def test_integer_camera_default_dtype_6471(self, device: torch.device, default_dtype: torch.dtype) -> None:
         """Check integer Q and baseline promotion under each supported default precision."""
         if device.type == "mps" and default_dtype == torch.float64:
@@ -278,6 +278,64 @@ class TestStereoCamera(BaseTester):
             self.assert_close(camera.tx, reference.tx)
             assert torch.get_default_dtype() == default_dtype
             self.assert_close(camera.Q, reference.Q)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+
+    @pytest.mark.parametrize("camera_dtype,fx,fy", [(torch.int16, 640, 640), (torch.int32, 100000, 1)])
+    @pytest.mark.parametrize("batch_size", [0, 1, 2])
+    def test_integer_camera_float16_intermediates_6471(
+        self, device: torch.device, dtype: torch.dtype, camera_dtype: torch.dtype, fx: int, fy: int, batch_size: int
+    ) -> None:
+        """Keep representable Q entries finite when integer products exceed the half-precision range."""
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float16)
+            left = torch.tensor(
+                [[[fx, 0, 320, 0], [0, fy, 240, 0], [0, 0, 1, 0]]], device=device, dtype=camera_dtype
+            ).expand(batch_size, -1, -1)
+            right = left.clone()
+            right[:, 0, 3] = -64
+            camera = StereoCamera(left, right)
+            baseline = -64 / fx
+            expected_q = torch.tensor(
+                [
+                    [fy * baseline, 0, 0, -fy * 320 * baseline],
+                    [0, fx * baseline, 0, -fx * 240 * baseline],
+                    [0, 0, 0, fx * fy * baseline],
+                    [0, 0, -fy, 0],
+                ],
+                device=device,
+                dtype=torch.float16,
+            ).expand(batch_size, -1, -1)
+            assert camera.Q.dtype == torch.float16
+            assert camera.Q.isfinite().all()
+            self.assert_close(camera.Q, expected_q, atol=0, rtol=0)
+            self.assert_close(camera.tx, torch.full((batch_size,), -baseline, device=device, dtype=torch.float16))
+            disparity = torch.full((batch_size, 1, 1, 1), 10.0, device=device, dtype=dtype)
+            points = camera.reproject_disparity_to_3D(disparity)
+            expected = torch.tensor([-320 * 6.4 / fx, -240 * 6.4 / fy, 6.4], device=device, dtype=dtype)
+            assert points.isfinite().all()
+            # Q is stored in float16 even when the disparity/output uses a wider dtype.
+            self.assert_close(points, expected.expand(batch_size, 1, 1, 3), atol=1e-4, rtol=1e-3)
+            assert camera.rectified_left_camera is left
+            assert camera.rectified_right_camera is right
+        finally:
+            torch.set_default_dtype(previous_dtype)
+
+    @pytest.mark.parametrize("translation", [-100000, -2147483648])
+    def test_integer_camera_float16_baseline_6471(self, device: torch.device, translation: int) -> None:
+        """Divide integer baseline operands before casting a representable quotient to float16."""
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float16)
+            left = torch.tensor([[[100000, 0, 320, 0], [0, 1, 240, 0], [0, 0, 1, 0]]], device=device, dtype=torch.int32)
+            right = left.clone()
+            right[:, 0, 3] = translation
+            camera = StereoCamera(left, right)
+            expected = torch.tensor([-translation / 100000], device=device, dtype=torch.float16)
+            assert camera.tx.dtype == torch.float16
+            assert camera.tx.isfinite().all()
+            self.assert_close(camera.tx, expected, atol=0, rtol=0)
         finally:
             torch.set_default_dtype(previous_dtype)
 
@@ -298,27 +356,61 @@ class TestStereoCamera(BaseTester):
 
         self.gradcheck(op, (camera.rectified_left_camera, camera.rectified_right_camera[:, 0, 3], disparity))
 
-    @pytest.mark.parametrize("camera_dtype", [torch.int8, torch.int64])
+    @pytest.mark.parametrize(
+        "camera_dtype,default_dtype,fx,fy,translation",
+        [
+            (torch.int8, torch.float32, 100, 100, -128),
+            (torch.int64, torch.float32, 100, 100, -128),
+            (torch.int16, torch.float16, 640, 640, -64),
+            (torch.int32, torch.float16, 100000, 1, -64),
+        ],
+    )
     def test_dynamo_integer_camera_6471(
         self,
         device: torch.device,
         dtype: torch.dtype,
-        torch_optimizer: Callable[..., Callable[..., torch.Tensor]],
+        torch_optimizer: Callable[..., Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]],
         optimizer_backend: str | None,
         camera_dtype: torch.dtype,
+        default_dtype: torch.dtype,
+        fx: int,
+        fy: int,
+        translation: int,
     ) -> None:
         """Require fullgraph compilation of integer-camera construction and reprojection."""
         if not optimizer_backend or optimizer_backend == "jit":
             pytest.skip("Integer-camera fullgraph capture requires torch.compile")
-        camera = self._asymmetric_stereo(device, camera_dtype, tx_fx=-128)
-        disparity = torch.full((1, 2, 3, 1), 10.0, device=device, dtype=dtype)
 
-        def op(left: torch.Tensor, right: torch.Tensor, disparity: torch.Tensor) -> torch.Tensor:
+        def op(
+            left: torch.Tensor, right: torch.Tensor, disparity: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """Capture construction and reprojection together in the compiled graph."""
-            return StereoCamera(left, right).reproject_disparity_to_3D(disparity)
+            camera = StereoCamera(left, right)
+            return camera.Q, camera.tx, camera.reproject_disparity_to_3D(disparity)
 
-        inputs = (camera.rectified_left_camera, camera.rectified_right_camera, disparity)
-        self.assert_close(torch_optimizer(op, fullgraph=True)(*inputs), op(*inputs))
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(default_dtype)
+            left = torch.tensor([[[fx, 0, 3, 0], [0, fy, 2, 0], [0, 0, 1, 0]]], device=device, dtype=camera_dtype)
+            right = left.clone()
+            right[:, 0, 3] = translation
+            disparity = torch.full((1, 2, 3, 1), 10.0, device=device, dtype=dtype)
+            inputs = (left, right, disparity)
+            actual_q, actual_tx, actual_points = torch_optimizer(op, fullgraph=True)(*inputs)
+            expected_q, expected_tx, expected_points = op(*inputs)
+            assert actual_q.isfinite().all()
+            assert actual_tx.isfinite().all()
+            assert actual_points.isfinite().all()
+            self.assert_close(actual_q, expected_q)
+            self.assert_close(actual_tx, expected_tx)
+            if default_dtype == torch.float16:
+                # Inductor can fuse away half round trips; Q's storage precision limits the eager points.
+                half_eps = torch.finfo(torch.float16).eps
+                self.assert_close(actual_points, expected_points, atol=half_eps, rtol=half_eps)
+            else:
+                self.assert_close(actual_points, expected_points)
+        finally:
+            torch.set_default_dtype(previous_dtype)
 
     @pytest.mark.parametrize("camera_index", [0, 1])
     @pytest.mark.parametrize("shape", [(3, 3), (4, 4), (3, 5)])

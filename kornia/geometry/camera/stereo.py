@@ -256,7 +256,8 @@ class StereoCamera:
     def tx(self) -> torch.Tensor:
         r"""The horizontal baseline between the two cameras.
 
-        Integer translations are promoted to the default floating-point dtype before negation.
+        Integer arithmetic is promoted before negation and division, using float32 when the default
+        dtype is float16. The result uses the default floating-point dtype.
 
         Returns:
             torch.Tensor of shape ``(B)``
@@ -264,7 +265,9 @@ class StereoCamera:
         """
         translation = self.rectified_right_camera[..., 0, 3]
         if not translation.is_floating_point():
-            translation = translation.to(torch.get_default_dtype())
+            dtype = torch.get_default_dtype()
+            compute_dtype = torch.float32 if dtype == torch.float16 else dtype
+            return (-translation.to(compute_dtype) / self.fx).to(dtype)
         return -translation / self.fx
 
     @property
@@ -277,6 +280,8 @@ class StereoCamera:
 
         Integer camera matrices use the default floating-point dtype for Q; floating-point cameras
         retain their dtype. The stored camera matrices and intrinsic parameter properties are unchanged.
+        Integer-camera products use float32 intermediates when the default dtype is float16, so
+        representable entries do not overflow before assignment.
 
         Return:
             The Q matrix of shape ``(B, 4, 4)``.
@@ -293,10 +298,18 @@ class StereoCamera:
         """
         floating_camera = self.rectified_left_camera.is_floating_point()
         dtype = self.dtype if floating_camera else torch.get_default_dtype()
+        compute_dtype = torch.float32 if not floating_camera and dtype == torch.float16 else dtype
         # Promote before products and negation, which can overflow for narrow integer cameras.
-        fx, fy = self.fx.to(dtype), self.fy.to(dtype)
-        cx_left, cx_right, cy = self.cx_left.to(dtype), self.cx_right.to(dtype), self.cy.to(dtype)
-        baseline: torch.Tensor = -self.tx
+        fx, fy = self.fx.to(compute_dtype), self.fy.to(compute_dtype)
+        cx_left, cx_right, cy = (
+            self.cx_left.to(compute_dtype),
+            self.cx_right.to(compute_dtype),
+            self.cy.to(compute_dtype),
+        )
+        # Use the unrounded integer baseline until the final Q entries are stored.
+        baseline: torch.Tensor = (
+            -self.tx if floating_camera else self.rectified_right_camera[..., 0, 3].to(compute_dtype) / fx
+        )
         Q = torch.zeros((self.batch_size, 4, 4), device=self.device, dtype=dtype)
         Q[:, 0, 0] = fy * baseline
         Q[:, 0, 3] = -fy * cx_left * baseline
